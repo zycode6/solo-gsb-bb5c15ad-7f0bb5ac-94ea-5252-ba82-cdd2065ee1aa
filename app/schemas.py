@@ -62,11 +62,27 @@ class CreateSessionRequest(BaseModel):
         default=None, ge=1, le=100_000,
         description="会话级并发租约上限：当前有效（未过期）租约数达到该值后，"
                     "单分片领取返回 409、批量领取只返回空列表；缺省/NULL 表示不限并发")
+    base_retry_seconds: int = Field(
+        default=5, ge=1, le=86_400,
+        description="失败退避基数（秒）：第 1 次失败冷却 base，第 n 次为 base×2^(n-1)，"
+                    "受 max_retry_seconds 封顶；必须为正数")
+    max_retry_seconds: int = Field(
+        default=300, ge=1, le=86_400,
+        description="失败退避冷却上限（秒）：实际冷却取 min(max, base×2^(n-1))；"
+                    "必须为正数且不小于 base_retry_seconds")
 
     @model_validator(mode="after")
     def _validate_dependencies(self):
         if self.dependencies:
             self.dependencies = validate_dependencies(self.dependencies, self.total_chunks)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_retry_range(self):
+        if self.max_retry_seconds < self.base_retry_seconds:
+            raise ValueError(
+                "max_retry_seconds must be greater than or equal to base_retry_seconds"
+            )
         return self
 
 
@@ -78,6 +94,8 @@ class SessionResponse(BaseModel):
     status: str
     max_active_leases: Optional[int] = Field(
         default=None, description="会话级并发租约上限；null 表示不限并发")
+    base_retry_seconds: int = Field(description="失败退避基数（秒）")
+    max_retry_seconds: int = Field(description="失败退避冷却上限（秒）")
     created_at: datetime
     finalized_at: Optional[datetime] = None
 
@@ -120,8 +138,8 @@ class BatchLeaseResponse(BaseModel):
         description="未完成、且前置依赖尚未全部完成的分片数量（不含已完成、不看租约状态）")
     next_expiry: Optional[datetime] = Field(
         default=None,
-        description="本次领取后会话内当前有效租约中最早的过期时间（槽位占满时可据此等待重试）；"
-                    "无有效租约时为 null")
+        description="本次领取后会话内最早的可重试时刻：取当前有效租约的最早过期时间与"
+                    "各分片退避冷却的最早结束时间中更早者（无可等待事件时为 null）")
     max_active_leases: Optional[int] = Field(
         default=None, description="会话级并发租约上限；null 表示不限并发")
     remaining_slots: Optional[int] = Field(
@@ -142,6 +160,22 @@ class CompleteResponse(BaseModel):
     idempotent_replay: bool = Field(default=False, description="是否为幂等重放")
 
 
+class FailRequest(BaseModel):
+    lease_token: str = Field(
+        min_length=1, max_length=128,
+        description="当前有效租约令牌：须与该分片持有的有效租约匹配")
+
+
+class FailResponse(BaseModel):
+    session_id: str
+    chunk_index: int
+    status: str = Field(description="上报后的分片状态：pending（租约已清除，等待冷却结束）")
+    failure_count: int = Field(description="该分片累计失败次数（完成上报后仍保留）")
+    retry_after_seconds: int = Field(
+        description="本次失败的冷却时长（秒）：min(max_retry_seconds, base×2^(n-1))")
+    retry_after: datetime = Field(description="冷却结束时间；在此之前该分片不可被领取")
+
+
 class ManifestEntry(BaseModel):
     chunk_index: int
     chunk_digest: str
@@ -160,12 +194,16 @@ class FinalizeResponse(BaseModel):
 
 class ChunkStatus(BaseModel):
     chunk_index: int
-    status: str  # pending | leased | completed（过期租约在读时按 pending 展示）
+    status: str  # pending | leased | completed（过期租约/冷却中的分片按 pending 展示）
     lease_expires_at: Optional[datetime] = None
     chunk_digest: Optional[str] = None
     completed_at: Optional[datetime] = None
     dependencies: list[int] = Field(default_factory=list,
                                     description="领取租约前必须完成的前置分片（升序）")
+    failure_count: int = Field(default=0, description="累计失败次数（完成上报后仍保留）")
+    retry_after: Optional[datetime] = Field(
+        default=None,
+        description="退避冷却结束时间；仅当该分片正处于冷却中时非 null，冷却结束或完成上报后为 null")
 
 
 class BlockedChunk(BaseModel):
@@ -173,12 +211,22 @@ class BlockedChunk(BaseModel):
     missing_dependencies: list[int] = Field(description="尚未完成的前置分片（升序）")
 
 
+class CoolingChunk(BaseModel):
+    chunk_index: int
+    failure_count: int = Field(description="该分片累计失败次数")
+    retry_after: datetime = Field(description="退避冷却结束时间，此前不可领取")
+
+
 class ReadyResponse(BaseModel):
     session_id: str
     ready_chunks: list[int] = Field(
-        description="当前可领取的分片：未完成、无有效租约（过期租约视为可领取）且前置已全部完成")
+        description="当前可领取的分片：未完成、无有效租约（过期租约视为可领取）、"
+                    "不在失败退避冷却中且前置已全部完成")
     blocked_chunks: list[BlockedChunk] = Field(
         description="被依赖阻塞的分片及各自未完成的前置项")
+    cooling_chunks: list[CoolingChunk] = Field(
+        default_factory=list,
+        description="因失败退避而暂时不可领取的分片（按序号升序）；冷却结束后自动恢复可领取")
 
 
 class SessionStatusResponse(BaseModel):
@@ -191,6 +239,8 @@ class SessionStatusResponse(BaseModel):
     digest_algorithm: str
     max_active_leases: Optional[int] = Field(
         default=None, description="会话级并发租约上限；null 表示不限并发")
+    base_retry_seconds: int = Field(default=5, description="失败退避基数（秒）")
+    max_retry_seconds: int = Field(default=300, description="失败退避冷却上限（秒）")
     active_leases: int = Field(
         default=0, description="当前有效（未过期）租约数，过期租约不计入")
     created_at: datetime

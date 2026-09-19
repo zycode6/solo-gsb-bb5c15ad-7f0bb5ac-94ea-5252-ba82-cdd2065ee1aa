@@ -8,6 +8,8 @@ services:
       UPLOAD_DB_PATH: /data/coordinator.db
       DEFAULT_LEASE_TTL_SECONDS: "300"
       MAX_LEASE_TTL_SECONDS: "3600"
+      DEFAULT_BASE_RETRY_SECONDS: "5"
+      DEFAULT_MAX_RETRY_SECONDS: "300"
     volumes:
       - coordinator-data:/data
     restart: unless-stopped

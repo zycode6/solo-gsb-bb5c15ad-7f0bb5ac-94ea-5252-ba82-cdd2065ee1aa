@@ -1,13 +1,16 @@
 """断点分片上传协调 API。
 
 仅协调元数据：不接收、不保存任何文件内容。
-- 创建会话：记录总分片数与期望文件摘要，可选提交分片依赖图（越界/自依赖/成环将被拒绝）
+- 创建会话：记录总分片数与期望文件摘要，可选提交分片依赖图（越界/自依赖/成环将被拒绝），
+  可选失败退避参数 base_retry_seconds（默认 5）与 max_retry_seconds（默认 300）
 - 领取租约：同一分片同一时刻仅一个有效租约，过期后可重新领取；
-  声明了依赖的分片须等前置分片全部完成后才可领取
-- 上报完成：需携带匹配租约令牌与分片摘要，重复上报幂等
+  声明了依赖的分片须等前置分片全部完成后才可领取；失败退避冷却中的分片不可领取
+- 上报完成：需携带匹配租约令牌与分片摘要，重复上报幂等；完成后清除退避冷却、保留累计失败次数
+- 上报失败：需携带当前有效租约令牌，成功后原子清除租约并递增失败次数，
+  第 n 次失败冷却 min(max, base×2^(n-1)) 秒，冷却期间单片/批量领取均跳过该分片
 - 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片
-- 状态查询：会话与逐分片状态（含各分片依赖）
-- 就绪查询：当前可领取的分片，以及被依赖阻塞的分片与各自缺失的前置项
+- 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间）
+- 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
 """
 from __future__ import annotations
 
@@ -30,7 +33,10 @@ from .schemas import (
     ChunkStatus,
     CompleteRequest,
     CompleteResponse,
+    CoolingChunk,
     CreateSessionRequest,
+    FailRequest,
+    FailResponse,
     FinalizeResponse,
     LeaseRequest,
     LeaseResponse,
@@ -42,6 +48,8 @@ from .schemas import (
 
 DEFAULT_LEASE_TTL_SECONDS = int(os.environ.get("DEFAULT_LEASE_TTL_SECONDS", "300"))
 MAX_LEASE_TTL_SECONDS = int(os.environ.get("MAX_LEASE_TTL_SECONDS", "3600"))
+DEFAULT_BASE_RETRY_SECONDS = int(os.environ.get("DEFAULT_BASE_RETRY_SECONDS", "5"))
+DEFAULT_MAX_RETRY_SECONDS = int(os.environ.get("DEFAULT_MAX_RETRY_SECONDS", "300"))
 
 
 def utcnow() -> datetime:
@@ -92,6 +100,21 @@ def lease_valid(chunk, now: datetime) -> bool:
     )
 
 
+def backoff_active(chunk, now: datetime) -> bool:
+    """该分片是否正处于失败退避冷却中（backoff_until 为空或已过期均视为未冷却）。"""
+    return (
+        chunk["backoff_until"] is not None
+        and parse_ts(chunk["backoff_until"]) > now
+    )
+
+
+def backoff_delay(session, failure_count: int) -> int:
+    """第 n 次失败的冷却秒数：min(max_retry_seconds, base_retry_seconds × 2^(n-1))。"""
+    base = session["base_retry_seconds"]
+    cap = session["max_retry_seconds"]
+    return min(cap, base * (2 ** (failure_count - 1)))
+
+
 def load_dependencies(session_id: str) -> dict[int, list[int]]:
     """读取会话的依赖图：chunk_index -> 升序前置分片列表。"""
     rows = get_conn().execute(
@@ -127,24 +150,35 @@ def count_active_leases(session_id: str, now: datetime) -> int:
     ).fetchone()["n"]
 
 
-def earliest_expiry(session_id: str) -> Optional[datetime]:
-    """会话内当前有效租约中最早的过期时间；无有效租约时返回 None。"""
-    row = get_conn().execute(
+def earliest_wakeup(session_id: str, now: datetime) -> Optional[datetime]:
+    """会话内最早的可重试时刻：有效租约的最早过期时间与各分片退避冷却的最早结束时间
+    中更早者；均不存在（或均已过期）时返回 None。"""
+    conn = get_conn()
+    lease_row = conn.execute(
         "SELECT MIN(lease_expires_at) AS earliest FROM chunks"
-        " WHERE session_id = ? AND status != 'completed' AND lease_expires_at IS NOT NULL",
-        (session_id,),
+        " WHERE session_id = ? AND status != 'completed'"
+        " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+        (session_id, now.isoformat()),
     ).fetchone()
-    if row is None or row["earliest"] is None:
-        return None
-    expires_at = parse_ts(row["earliest"])
-    return expires_at if expires_at > utcnow() else None
+    backoff_row = conn.execute(
+        "SELECT MIN(backoff_until) AS earliest FROM chunks"
+        " WHERE session_id = ? AND status != 'completed'"
+        " AND backoff_until IS NOT NULL AND backoff_until > ?",
+        (session_id, now.isoformat()),
+    ).fetchone()
+    candidates = [
+        parse_ts(lease_row["earliest"]) if lease_row["earliest"] else None,
+        parse_ts(backoff_row["earliest"]) if backoff_row["earliest"] else None,
+    ]
+    candidates = [ts for ts in candidates if ts is not None]
+    return min(candidates) if candidates else None
 
 
 def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
     """临界区内调用：返回（按序号升序的可领取分片列表, 被依赖阻塞的未完成分片数）。
 
-    可领取 = 未完成、无有效租约（过期租约视为空闲）且前置分片全部完成；
-    被阻塞 = 未完成且至少一个前置分片尚未完成（无论该分片当前是否持有有效租约）。
+    可领取 = 未完成、无有效租约（过期租约视为空闲）、不在失败退避冷却中且前置分片全部完成；
+    被阻塞 = 未完成且至少一个前置分片尚未完成（无论该分片当前是否持有有效租约或处于冷却）。
     """
     rows = get_conn().execute(
         "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
@@ -160,7 +194,7 @@ def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
         chunk_index = row["chunk_index"]
         if any(d not in completed for d in deps.get(chunk_index, [])):
             blocked += 1
-        elif not lease_valid(row, now):
+        elif not lease_valid(row, now) and not backoff_active(row, now):
             ready.append(chunk_index)
     return ready, blocked
 
@@ -186,10 +220,11 @@ def create_session(req: CreateSessionRequest):
         conn = get_conn()
         conn.execute(
             "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
-            " max_active_leases, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?)",
+            " max_active_leases, base_retry_seconds, max_retry_seconds, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
             (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
-             req.max_active_leases, now.isoformat()),
+             req.max_active_leases, req.base_retry_seconds, req.max_retry_seconds,
+             now.isoformat()),
         )
         conn.executemany(
             "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
@@ -207,6 +242,8 @@ def create_session(req: CreateSessionRequest):
         digest_algorithm=req.digest_algorithm,
         status="active",
         max_active_leases=req.max_active_leases,
+        base_retry_seconds=req.base_retry_seconds,
+        max_retry_seconds=req.max_retry_seconds,
         created_at=now,
     )
 
@@ -234,6 +271,10 @@ def get_session_status(session_id: str):
         if status == "leased" and (lease_expires_at is None or lease_expires_at <= now):
             status = "pending"  # 租约已过期，读时按可领取展示
             lease_expires_at = None
+        # 冷却截止时间按读时口径展示：已过期的退避不再报告
+        retry_after = parse_ts(row["backoff_until"]) if row["backoff_until"] else None
+        if retry_after is not None and retry_after <= now:
+            retry_after = None
         if row["status"] != "completed":
             missing.append(row["chunk_index"])
         chunks.append(
@@ -244,6 +285,8 @@ def get_session_status(session_id: str):
                 chunk_digest=row["chunk_digest"],
                 completed_at=parse_ts(row["completed_at"]) if row["completed_at"] else None,
                 dependencies=deps.get(row["chunk_index"], []),
+                failure_count=row["failure_count"] or 0,
+                retry_after=retry_after,
             )
         )
 
@@ -256,6 +299,8 @@ def get_session_status(session_id: str):
         file_digest=session["file_digest"],
         digest_algorithm=session["digest_algorithm"],
         max_active_leases=session["max_active_leases"],
+        base_retry_seconds=session["base_retry_seconds"],
+        max_retry_seconds=session["max_retry_seconds"],
         active_leases=sum(
             1 for c in chunks
             if c.status == "leased" and c.lease_expires_at is not None
@@ -286,6 +331,7 @@ def get_ready_chunks(session_id: str):
     completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
     ready: list[int] = []
     blocked: list[BlockedChunk] = []
+    cooling: list[CoolingChunk] = []
     for row in rows:
         chunk_index = row["chunk_index"]
         if row["status"] == "completed":
@@ -295,6 +341,15 @@ def get_ready_chunks(session_id: str):
             blocked.append(
                 BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
             )
+        elif backoff_active(row, now):
+            # 失败退避冷却中：不可被单片或批量领取，冷却结束后自动恢复
+            cooling.append(
+                CoolingChunk(
+                    chunk_index=chunk_index,
+                    failure_count=row["failure_count"] or 0,
+                    retry_after=parse_ts(row["backoff_until"]),
+                )
+            )
         elif not lease_valid(row, now):
             # 无租约或租约已过期，且前置已全部完成：立即可领取
             ready.append(chunk_index)
@@ -303,6 +358,7 @@ def get_ready_chunks(session_id: str):
         session_id=session_id,
         ready_chunks=ready,
         blocked_chunks=blocked,
+        cooling_chunks=cooling,
     )
 
 
@@ -337,6 +393,13 @@ def claim_lease(
             return conflict(
                 "chunk lease already held",
                 lease_expires_at=chunk["lease_expires_at"],
+            )
+        if backoff_active(chunk, now):
+            # 失败退避冷却中：单片领取同样拒绝，直至 retry_after
+            return conflict(
+                "chunk in failure backoff",
+                failure_count=chunk["failure_count"] or 0,
+                retry_after=chunk["backoff_until"],
             )
         missing_deps = incomplete_dependencies(session_id, chunk_index)
         if missing_deps:
@@ -418,7 +481,8 @@ def claim_leases_batch(session_id: str, req: BatchLeaseRequest):
             conn.commit()
 
         active_after = active + len(granted)
-        next_expiry = earliest_expiry(session_id)
+        # 无可领取项时，调用方可据 next_expiry 等待：有效租约过期或退避冷却结束，取更早者
+        next_expiry = earliest_wakeup(session_id, now)
 
     return BatchLeaseResponse(
         session_id=session_id,
@@ -472,7 +536,8 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
             raise HTTPException(status_code=409, detail="lease expired")
 
         get_conn().execute(
-            "UPDATE chunks SET status = 'completed', chunk_digest = ?, completed_at = ?"
+            "UPDATE chunks SET status = 'completed', chunk_digest = ?, completed_at = ?,"
+            " backoff_until = NULL"
             " WHERE session_id = ? AND chunk_index = ?",
             (req.chunk_digest, now.isoformat(), session_id, chunk_index),
         )
@@ -485,6 +550,54 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
         chunk_digest=req.chunk_digest,
         completed_at=now,
         idempotent_replay=False,
+    )
+
+
+# ---------------------------------------------------------------- 失败上报
+
+@app.post(
+    "/sessions/{session_id}/chunks/{chunk_index}/fail",
+    response_model=FailResponse,
+    tags=["chunks"],
+    summary="上报分片失败（校验当前有效租约，清除租约并进入指数退避）",
+    responses={409: {"description": "分片已完成、会话已提交、租约令牌不匹配或租约已过期"}},
+)
+def fail_chunk(session_id: str, chunk_index: int, req: FailRequest):
+    """成功后在同一事务内原子地：校验令牌 → 清除租约（状态回到 pending、清空令牌与过期时间）
+    → failure_count + 1 → 计算 backoff_until = now + min(max, base×2^(n-1))。"""
+    now = utcnow()
+    with DB_LOCK:
+        session = get_session_or_404(session_id)
+        chunk = get_chunk_or_404(session_id, chunk_index)
+
+        if chunk["status"] == "completed":
+            raise HTTPException(status_code=409, detail="chunk already completed")
+        if session["status"] == "finalized":
+            raise HTTPException(status_code=409, detail="session already finalized")
+        if chunk["lease_token"] is None or chunk["lease_token"] != req.lease_token:
+            raise HTTPException(status_code=409, detail="lease token mismatch")
+        if not lease_valid(chunk, now):
+            raise HTTPException(status_code=409, detail="lease expired")
+
+        failure_count = (chunk["failure_count"] or 0) + 1
+        delay = backoff_delay(session, failure_count)
+        retry_after = now + timedelta(seconds=delay)
+        # 原子清除租约 + 递增失败次数 + 设置冷却截止；failure_count 永不因本接口清零
+        get_conn().execute(
+            "UPDATE chunks SET status = 'pending', lease_token = NULL,"
+            " lease_expires_at = NULL, failure_count = ?, backoff_until = ?"
+            " WHERE session_id = ? AND chunk_index = ?",
+            (failure_count, retry_after.isoformat(), session_id, chunk_index),
+        )
+        get_conn().commit()
+
+    return FailResponse(
+        session_id=session_id,
+        chunk_index=chunk_index,
+        status="pending",
+        failure_count=failure_count,
+        retry_after_seconds=delay,
+        retry_after=retry_after,
     )
 
 
@@ -554,4 +667,6 @@ def root():
         "openapi": "/openapi.json",
         "default_lease_ttl_seconds": DEFAULT_LEASE_TTL_SECONDS,
         "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
+        "default_base_retry_seconds": DEFAULT_BASE_RETRY_SECONDS,
+        "default_max_retry_seconds": DEFAULT_MAX_RETRY_SECONDS,
     }

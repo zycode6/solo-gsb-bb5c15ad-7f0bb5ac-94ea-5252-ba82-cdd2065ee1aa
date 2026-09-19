@@ -15,14 +15,16 @@ _conn: sqlite3.Connection | None = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id                TEXT PRIMARY KEY,
-    total_chunks      INTEGER NOT NULL,
-    file_digest       TEXT NOT NULL,
-    digest_algorithm  TEXT NOT NULL DEFAULT 'sha256',
-    status            TEXT NOT NULL DEFAULT 'active',   -- active | finalized
-    max_active_leases INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
-    created_at        TEXT NOT NULL,
-    finalized_at      TEXT
+    id                  TEXT PRIMARY KEY,
+    total_chunks        INTEGER NOT NULL,
+    file_digest         TEXT NOT NULL,
+    digest_algorithm    TEXT NOT NULL DEFAULT 'sha256',
+    status              TEXT NOT NULL DEFAULT 'active',   -- active | finalized
+    max_active_leases   INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
+    base_retry_seconds  INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
+    max_retry_seconds   INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
+    created_at          TEXT NOT NULL,
+    finalized_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -33,6 +35,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     lease_expires_at  TEXT,
     chunk_digest      TEXT,
     completed_at      TEXT,
+    failure_count     INTEGER NOT NULL DEFAULT 0,       -- 累计失败次数（完成上报不清零）
+    backoff_until     TEXT,                             -- 退避冷却结束时间；NULL 表示未在冷却
     PRIMARY KEY (session_id, chunk_index)
 );
 
@@ -57,6 +61,24 @@ MIGRATIONS = [
     (
         "sessions.max_active_leases",
         "ALTER TABLE sessions ADD COLUMN max_active_leases INTEGER",
+    ),
+    # 0002: 失败退避参数；旧库既有会话取服务端默认值 5/300，保持可继续退避
+    (
+        "sessions.base_retry_seconds",
+        "ALTER TABLE sessions ADD COLUMN base_retry_seconds INTEGER NOT NULL DEFAULT 5",
+    ),
+    (
+        "sessions.max_retry_seconds",
+        "ALTER TABLE sessions ADD COLUMN max_retry_seconds INTEGER NOT NULL DEFAULT 300",
+    ),
+    # 0003: 分片级失败计数与冷却截止时间；既有分片从 0/NULL 开始，无冷却
+    (
+        "chunks.failure_count",
+        "ALTER TABLE chunks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "chunks.backoff_until",
+        "ALTER TABLE chunks ADD COLUMN backoff_until TEXT",
     ),
 ]
 
