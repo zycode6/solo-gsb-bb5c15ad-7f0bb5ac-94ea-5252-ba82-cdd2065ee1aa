@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     digest_algorithm  TEXT NOT NULL DEFAULT 'sha256',
     status            TEXT NOT NULL DEFAULT 'active',   -- active | finalized
     max_active_leases INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
+    base_retry_seconds INTEGER NOT NULL DEFAULT 5,      -- 失败退避基数（秒）
+    max_retry_seconds  INTEGER NOT NULL DEFAULT 300,    -- 失败退避上限（秒）
     created_at        TEXT NOT NULL,
     finalized_at      TEXT
 );
@@ -33,6 +35,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     lease_expires_at  TEXT,
     chunk_digest      TEXT,
     completed_at      TEXT,
+    failure_count     INTEGER NOT NULL DEFAULT 0,       -- 累计失败上报次数（完成后仍保留）
+    retry_after       TEXT,                             -- 退避冷却结束时刻；NULL 表示未冷却
     PRIMARY KEY (session_id, chunk_index)
 );
 
@@ -57,6 +61,24 @@ MIGRATIONS = [
     (
         "sessions.max_active_leases",
         "ALTER TABLE sessions ADD COLUMN max_active_leases INTEGER",
+    ),
+    # 0002: 失败退避参数；旧会话回填默认值 5/300，行为等价于新建库的默认退避策略
+    (
+        "sessions.base_retry_seconds",
+        "ALTER TABLE sessions ADD COLUMN base_retry_seconds INTEGER NOT NULL DEFAULT 5",
+    ),
+    (
+        "sessions.max_retry_seconds",
+        "ALTER TABLE sessions ADD COLUMN max_retry_seconds INTEGER NOT NULL DEFAULT 300",
+    ),
+    # 0003: 分片失败计数与冷却结束时刻；旧分片计数为 0、无冷却
+    (
+        "chunks.failure_count",
+        "ALTER TABLE chunks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "chunks.retry_after",
+        "ALTER TABLE chunks ADD COLUMN retry_after TEXT",
     ),
 ]
 

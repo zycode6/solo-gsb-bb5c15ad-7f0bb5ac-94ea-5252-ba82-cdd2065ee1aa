@@ -41,7 +41,8 @@ docker compose up --build
 - **依赖（可选）**：创建会话时可提交 `dependencies`（键与值均为分片序号），声明某分片领取租约前必须完成的前置分片。越界、自依赖、有环的依赖图会被拒绝（`422`）；不提供时保持无依赖的原有行为。
 - **租约**：同一分片同一时刻仅允许一个有效租约；租约过期后可被重新领取（令牌轮换）。前置分片未全部完成时领取返回 `409` 及按序缺失的 `missing_dependencies`；前置全部完成后无需额外操作即可领取。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
-- **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项或无剩余槽位时返回空列表及 `active` / `blocked` / `next_expiry` 汇总。
+- **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在失败退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项或无剩余槽位时返回空列表及 `active` / `blocked` / `next_expiry` 汇总；`next_expiry` 取**有效租约最早过期时间与冷却分片最早退避结束时间中的较早者**。
+- **失败上报与退避重试**：`POST /sessions/{id}/chunks/{index}/fail` 必须携带该分片**当前有效租约的令牌**；成功后在同一原子操作中清除租约（状态回到可调度池）、递增该分片的 `failure_count`，并进入指数退避冷却：第 n 次失败冷却 `min(max_retry_seconds, base_retry_seconds × 2^(n-1))` 秒（默认 base=5、max=300，即 5s、10s、20s…上限 300s）。冷却结束前该分片不可被单片或批量领取（单片返回 `409` 及 `retry_after`、`failure_count`）。之后上报**完成**会清除退避状态（`retry_after` 置空），但历史失败次数 `failure_count` 保留。
 - **完成上报**：必须携带该分片**当前有效租约的令牌**与分片摘要；以相同令牌 + 相同摘要重复上报为幂等成功（返回 `idempotent_replay: true`），摘要不同则返回 `409`。
 - **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
@@ -50,12 +51,13 @@ docker compose up --build
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限） |
-| `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`max_active_leases` 与当前 `active_leases`） |
-| `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片，及被依赖阻塞的分片与各自未完成前置项 |
-| `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 约束） |
-| `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位） |
-| `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等） |
+| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数） |
+| `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`，以及 `max_active_leases`、退避参数与当前 `active_leases`） |
+| `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片、退避冷却中的分片（含 `retry_after`/`failure_count`）及 `next_expiry` |
+| `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（受 `max_active_leases` 约束；冷却中返回 409） |
+| `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位；自动跳过冷却分片） |
+| `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等；清除退避状态、保留失败次数） |
+| `POST` | `/sessions/{session_id}/chunks/{index}/fail` | 上报分片失败（需有效租约令牌；原子释放租约、递增失败计数并进入指数退避冷却） |
 | `POST` | `/sessions/{session_id}/finalize` | 提交会话，返回按序分片清单 |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -100,6 +102,46 @@ curl -s http://localhost:8000/sessions/$SID
 其数量汇总在响应的 `blocked` 中；前置分片陆续完成后会自动具备领取资格。
 不设置 `max_active_leases` 的会话中，`max_active_leases` 与 `remaining_slots` 均为 `null`，
 批量领取只受 `count` 与可领取分片数约束。
+
+## 失败上报与退避重试（curl）
+
+```bash
+# 1. 创建会话时自定义退避参数（缺省 base=5、max=300；要求均为正且 max ≥ base）
+SID=$(curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"total_chunks": 4, "file_digest": "<文件SHA256>",
+       "base_retry_seconds": 10, "max_retry_seconds": 300}' \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+
+# 2. 领取租约后传输失败：用当前有效租约令牌上报失败
+LEASE=$(curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/lease)
+TOKEN=$(echo "$LEASE" | python3 -c 'import sys, json; print(json.load(sys.stdin)["lease_token"])')
+curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/fail \
+  -H 'Content-Type: application/json' -d "{\"lease_token\": \"$TOKEN\"}"
+# => {"session_id": "...", "chunk_index": 0, "status": "cooling",
+#     "failure_count": 1, "retry_after": "2026-...Z"}
+#    首次失败冷却 min(300, 10×2^0) = 10 秒；第 n 次为 min(max, 10×2^(n-1))
+
+# 3. 冷却结束前不可领取：单片 409；批量自动跳过该分片
+curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/lease
+# => 409 {"detail": "chunk is in retry backoff",
+#         "retry_after": "2026-...Z", "failure_count": 1}
+curl -s http://localhost:8000/sessions/$SID/ready
+# => {"ready_chunks": [1, 2, 3], "blocked_chunks": [],
+#     "cooling_chunks": [{"chunk_index": 0, "retry_after": "...", "failure_count": 1}],
+#     "next_expiry": "2026-...Z"}
+
+# 4. 冷却结束后重新领取；成功完成会清除 retry_after，但 failure_count 保留
+curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/complete \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\": \"$NEW_TOKEN\", \"chunk_digest\": \"<分片0的SHA256>\"}"
+# 状态查询中该分片：status=completed, failure_count=1, retry_after=null
+```
+
+失败上报要求令牌与**当前有效（未过期）**租约匹配；令牌缺失/不匹配、租约过期、
+分片已完成或会话已提交均返回 `409`。失败不是幂等操作：每次成功上报都会使
+`failure_count` 递增并重新计算冷却。批量领取在无可领取项时，`next_expiry` 取
+“有效租约过期”与“退避冷却结束”两类事件中的最早时间，客户端可据此等待后重试。
 
 ## 调用示例（curl）
 

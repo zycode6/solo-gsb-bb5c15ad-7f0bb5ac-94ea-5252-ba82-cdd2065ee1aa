@@ -31,6 +31,13 @@ def lease(session_id, index, ttl=None):
     return client.post(f"/sessions/{session_id}/chunks/{index}/lease", json=body)
 
 
+def fail(session_id, index, token):
+    return client.post(
+        f"/sessions/{session_id}/chunks/{index}/fail",
+        json={"lease_token": token},
+    )
+
+
 def complete(session_id, index, token, digest):
     return client.post(
         f"/sessions/{session_id}/chunks/{index}/complete",
@@ -599,4 +606,338 @@ def test_migration_adds_max_active_leases_to_legacy_database(tmp_path):
     ).fetchone()
     assert row[0] is None
     db.run_migrations(migrated)  # 再次执行不报错
+    migrated.close()
+
+
+# ---------------------------------------------------------------- 失败上报与退避重试
+
+def make_retry_session(total_chunks=2, base=5, max_=300, **kw):
+    payload = {
+        "total_chunks": total_chunks,
+        "file_digest": "f" * 64,
+        "digest_algorithm": "sha256",
+        "base_retry_seconds": base,
+        "max_retry_seconds": max_,
+    }
+    payload.update(kw)
+    resp = client.post("/sessions", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_retry_settings_defaults_and_persistence():
+    s = make_session()
+    assert s["base_retry_seconds"] == 5
+    assert s["max_retry_seconds"] == 300
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["base_retry_seconds"] == 5
+    assert st["max_retry_seconds"] == 300
+    # 分片初始无失败计数与冷却
+    c = st["chunks"][0]
+    assert c["failure_count"] == 0
+    assert c["retry_after"] is None
+
+
+def test_invalid_retry_settings_rejected():
+    # 非正数
+    assert create_session_raw(
+        {"total_chunks": 3, "base_retry_seconds": 0}).status_code == 422
+    assert create_session_raw(
+        {"total_chunks": 3, "max_retry_seconds": -5}).status_code == 422
+    # 上限小于基数
+    assert create_session_raw(
+        {"total_chunks": 3, "base_retry_seconds": 100,
+         "max_retry_seconds": 99}).status_code == 422
+    # 相等是允许的
+    assert create_session_raw(
+        {"total_chunks": 3, "base_retry_seconds": 60,
+         "max_retry_seconds": 60}).status_code == 201
+
+
+def test_fail_requires_valid_lease_token():
+    s = make_retry_session()
+    # 未领取租约直接上报失败
+    assert fail(s["id"], 0, "no-such-token").status_code == 409
+
+    token = lease(s["id"], 0, ttl=3600).json()["lease_token"]
+    # 令牌不匹配
+    assert fail(s["id"], 0, "wrong-token").status_code == 409
+    # 正确令牌：成功，计数 1，返回冷却结束时刻
+    r = fail(s["id"], 0, token)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "cooling"
+    assert body["failure_count"] == 1
+    retry_at = datetime.fromisoformat(body["retry_after"])
+    assert retry_at > datetime.now(timezone.utc)
+
+    # 租约已被原子清除：原令牌不可再上报失败
+    assert fail(s["id"], 0, token).status_code == 409
+
+    # 租约过期后上报失败同样被拒绝
+    s2 = make_retry_session()
+    t2 = lease(s2["id"], 0).json()["lease_token"]
+    expire_lease(s2["id"], 0)
+    assert fail(s2["id"], 0, t2).status_code == 409
+
+
+def test_fail_on_completed_or_finalized_chunk_rejected():
+    s = make_retry_session()
+    token = lease(s["id"], 0, ttl=3600).json()["lease_token"]
+    assert complete(s["id"], 0, token, "a" * 64).status_code == 200
+    # 已完成分片不可再上报失败
+    assert fail(s["id"], 0, token).status_code == 409
+
+    token1 = lease(s["id"], 1, ttl=3600).json()["lease_token"]
+    assert complete(s["id"], 1, token1, "b" * 64).status_code == 200
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+    # 已提交会话中的（已完成）分片再上报失败仍被拒绝
+    assert fail(s["id"], 0, token).status_code == 409
+
+
+def clear_cooldown(session_id, index):
+    get_conn().execute(
+        "UPDATE chunks SET retry_after = '2000-01-01T00:00:00+00:00'"
+        " WHERE session_id = ? AND chunk_index = ?",
+        (session_id, index),
+    )
+    get_conn().commit()
+
+
+def test_exponential_backoff_delay_sequence():
+    s = make_retry_session(total_chunks=1, base=10, max_=100)
+    sid = s["id"]
+
+    def fail_and_expect_delay(delay_seconds):
+        token = lease(sid, 0, ttl=3600).json()["lease_token"]
+        r = fail(sid, 0, token)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        retry_at = datetime.fromisoformat(body["retry_after"])
+        now = datetime.now(timezone.utc)
+        delta = (retry_at - now).total_seconds()
+        assert delay_seconds - 2 <= delta <= delay_seconds + 2
+        return body["failure_count"]
+
+    # 10, 20, 40, 80, 100（上限截断）, 100 ...
+    assert fail_and_expect_delay(10) == 1
+    clear_cooldown(sid, 0)
+    assert fail_and_expect_delay(20) == 2
+    clear_cooldown(sid, 0)
+    assert fail_and_expect_delay(40) == 3
+    clear_cooldown(sid, 0)
+    assert fail_and_expect_delay(80) == 4
+    clear_cooldown(sid, 0)
+    assert fail_and_expect_delay(100) == 5
+    clear_cooldown(sid, 0)
+    assert fail_and_expect_delay(100) == 6
+
+
+def test_cooling_chunk_not_claimable_single_or_batch():
+    s = make_retry_session(total_chunks=3, base=100, max_=300)
+    sid = s["id"]
+    token = lease(sid, 0, ttl=3600).json()["lease_token"]
+    r = fail(sid, 0, token)
+    assert r.status_code == 200
+    retry_at = r.json()["retry_after"]
+
+    # 单片领取：409 + retry_after / failure_count
+    r2 = lease(sid, 0)
+    assert r2.status_code == 409
+    assert r2.json()["detail"] == "chunk is in retry backoff"
+    assert r2.json()["retry_after"] == retry_at
+    assert r2.json()["failure_count"] == 1
+
+    # 批量领取跳过冷却分片，只发其它可领取分片
+    rb = batch_lease(sid, 10)
+    assert [g["chunk_index"] for g in rb.json()["granted"]] == [1, 2]
+
+    # /ready：冷却分片既不在 ready 也不在 blocked，而在 cooling_chunks
+    rr = ready(sid)
+    assert rr["ready_chunks"] == []
+    assert rr["blocked_chunks"] == []
+    assert rr["cooling_chunks"] == [
+        {"chunk_index": 0, "retry_after": retry_at, "failure_count": 1}]
+
+    # 冷却结束后单片与批量均可再次领取，且失败计数已递增保留
+    clear_cooldown(sid, 0)
+    assert lease(sid, 0, ttl=3600).status_code == 200
+    st = client.get(f"/sessions/{sid}").json()
+    assert st["chunks"][0]["failure_count"] == 1
+    assert st["chunks"][0]["retry_after"] is None
+
+
+def test_status_reports_cooling_state():
+    s = make_retry_session(total_chunks=1, base=100)
+    sid = s["id"]
+    token = lease(sid, 0, ttl=3600).json()["lease_token"]
+    r = fail(sid, 0, token)
+    retry_at = r.json()["retry_after"]
+
+    st = client.get(f"/sessions/{sid}").json()
+    c = st["chunks"][0]
+    assert c["status"] == "cooling"
+    assert c["retry_after"] == retry_at
+    assert c["failure_count"] == 1
+
+    # 冷却结束后读时恢复为 pending，retry_after 清空，计数保留
+    clear_cooldown(sid, 0)
+    st2 = client.get(f"/sessions/{sid}").json()
+    c2 = st2["chunks"][0]
+    assert c2["status"] == "pending"
+    assert c2["retry_after"] is None
+    assert c2["failure_count"] == 1
+
+
+def test_complete_clears_backoff_but_keeps_failure_count():
+    s = make_retry_session(total_chunks=1, base=100)
+    sid = s["id"]
+    # 失败一次进入冷却
+    token = lease(sid, 0, ttl=3600).json()["lease_token"]
+    assert fail(sid, 0, token).status_code == 200
+
+    # 冷却结束后重新领取并完成
+    clear_cooldown(sid, 0)
+    token2 = lease(sid, 0, ttl=3600).json()["lease_token"]
+    digest = "a" * 64
+    rc = complete(sid, 0, token2, digest)
+    assert rc.status_code == 200
+
+    st = client.get(f"/sessions/{sid}").json()
+    c = st["chunks"][0]
+    assert c["status"] == "completed"
+    assert c["retry_after"] is None       # 退避状态已清除
+    assert c["failure_count"] == 1        # 失败计数保留
+    assert c["chunk_digest"] == digest
+
+    # 完成后不会再出现在 /ready 的冷却列表中
+    rr = ready(sid)
+    assert rr["cooling_chunks"] == []
+    assert rr["ready_chunks"] == []
+
+
+def test_batch_next_expiry_considers_backoff_end():
+    # 无有效租约、仅冷却中的分片：next_expiry 取退避结束时间
+    s = make_retry_session(total_chunks=2, base=100, max_=300)
+    sid = s["id"]
+    token = lease(sid, 0, ttl=3600).json()["lease_token"]
+    rfail = fail(sid, 0, token)
+    retry_at = rfail.json()["retry_after"]
+
+    rb = batch_lease(sid, 10)
+    body = rb.json()
+    assert [g["chunk_index"] for g in body["granted"]] == [1]
+    # 1 号租约 3600s 后过期，0 号约 100s 后退避结束 => 最早为退避结束
+    assert body["next_expiry"] == retry_at
+
+    # /ready 同样透出该时间
+    assert ready(sid)["next_expiry"] == retry_at
+
+
+def test_batch_next_expiry_picks_earlier_lease_expiry():
+    # 一个分片持约 60s 后过期的租约，另一个分片在约 1000s 的长冷却中：
+    # next_expiry 应取更早的租约过期时间，而非退避结束时间
+    from datetime import timedelta
+    s = make_retry_session(total_chunks=3, base=1000, max_=3600)
+    sid = s["id"]
+    token0 = lease(sid, 0, ttl=3600).json()["lease_token"]
+    fail(sid, 0, token0)  # 0 进入约 1000s 冷却
+    batch_lease(sid, 10)  # 领取 1、2（默认 TTL 300s）
+    # 将 1 号租约提前到约 60s 后过期
+    get_conn().execute(
+        "UPDATE chunks SET lease_expires_at = ? WHERE session_id = ? AND chunk_index = 1",
+        ((datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(), sid),
+    )
+    get_conn().commit()
+
+    body = batch_lease(sid, 10).json()
+    assert body["granted"] == []
+    next_at = datetime.fromisoformat(body["next_expiry"])
+    now = datetime.now(timezone.utc)
+    assert 55 < (next_at - now).total_seconds() < 70
+
+
+def test_fail_unknown_session_and_chunk():
+    assert fail("nope", 0, "t").status_code == 404
+    s = make_retry_session()
+    assert fail(s["id"], 99, "t").status_code == 404
+
+
+def test_cooling_chunk_with_unmet_dependencies():
+    # 1 号依赖 0 号：通过直接插入依赖行制造“前置未完成 + 处于冷却”的组合状态，
+    # 验证批量不发放、ready 同时在 blocked 与 cooling 中列出
+    s = make_retry_session(total_chunks=2, base=100, max_=300)
+    sid = s["id"]
+    token = lease(sid, 1, ttl=3600).json()["lease_token"]
+    get_conn().execute(
+        "INSERT INTO chunk_dependencies (session_id, chunk_index, depends_on)"
+        " VALUES (?, 1, 0)",
+        (sid,),
+    )
+    get_conn().commit()
+    assert fail(sid, 1, token).status_code == 200
+
+    rr = ready(sid)
+    assert rr["ready_chunks"] == [0]
+    assert rr["blocked_chunks"] == [{"chunk_index": 1, "missing_dependencies": [0]}]
+    assert [c["chunk_index"] for c in rr["cooling_chunks"]] == [1]
+    # 单片领取：依赖检查先于冷却检查，返回缺失依赖
+    assert lease(sid, 1).status_code == 409
+    # 批量领取只拿到 0
+    assert [g["chunk_index"] for g in batch_lease(sid, 10).json()["granted"]] == [0]
+
+
+def test_migration_adds_retry_columns_to_legacy_database(tmp_path):
+    import sqlite3
+
+    legacy = tmp_path / "legacy_retry.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+            file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            status TEXT NOT NULL DEFAULT 'active',
+            max_active_leases INTEGER,
+            created_at TEXT NOT NULL, finalized_at TEXT
+        );
+        CREATE TABLE chunks (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+            lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+            PRIMARY KEY (session_id, chunk_index)
+        );
+        INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm,
+                              status, created_at)
+            VALUES ('legacy-sid', 1, 'dig', 'sha256', 'active',
+                    '2026-01-01T00:00:00+00:00');
+        INSERT INTO chunks (session_id, chunk_index) VALUES ('legacy-sid', 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    import app.db as db
+
+    migrated = sqlite3.connect(legacy)
+    db.run_migrations(migrated)  # 幂等执行多次
+    db.run_migrations(migrated)
+
+    session_cols = {r[1] for r in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
+    assert {"base_retry_seconds", "max_retry_seconds"} <= session_cols
+    chunk_cols = {r[1] for r in migrated.execute("PRAGMA table_info(chunks)").fetchall()}
+    assert {"failure_count", "retry_after"} <= chunk_cols
+
+    # 旧会话回填默认退避参数
+    row = migrated.execute(
+        "SELECT base_retry_seconds, max_retry_seconds FROM sessions"
+        " WHERE id = 'legacy-sid'"
+    ).fetchone()
+    assert row == (5, 300)
+    # 旧分片失败计数为 0、无冷却
+    row = migrated.execute(
+        "SELECT failure_count, retry_after FROM chunks"
+        " WHERE session_id = 'legacy-sid' AND chunk_index = 0"
+    ).fetchone()
+    assert row[0] == 0 and row[1] is None
     migrated.close()
